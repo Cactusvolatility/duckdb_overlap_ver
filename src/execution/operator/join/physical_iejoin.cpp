@@ -54,6 +54,11 @@ PhysicalIEJoin::PhysicalIEJoin(LogicalComparisonJoin &op, PhysicalOperator &left
 		rhs_orders.emplace_back(sense, OrderByNullType::NULLS_LAST, std::move(right));
 	}
 
+	fprintf(stderr, "LHS0: %s\n", lhs_orders[0].expression->ToString().c_str());
+	fprintf(stderr, "RHS0: %s\n", rhs_orders[0].expression->ToString().c_str());
+	fprintf(stderr, "LHS1: %s\n", lhs_orders[1].expression->ToString().c_str());
+	fprintf(stderr, "RHS1: %s\n", rhs_orders[1].expression->ToString().c_str());
+
 	for (idx_t i = 2; i < conditions.size(); ++i) {
 		auto &cond = conditions[i];
 		D_ASSERT(cond.left->return_type == cond.right->return_type);
@@ -272,6 +277,35 @@ struct IEJoinUnion {
 	unique_ptr<SBIterator> op2;
 	unique_ptr<SBIterator> off2;
 	int64_t lrid;
+
+	struct SweeplineEvent {
+		timestamp_t time;
+		bool is_start;
+		int64_t rid; // going to borrow from IEJoinUnion
+    
+    	// For sorting events
+		bool operator<(const SweeplineEvent &other) const {
+			if (time.value != other.time.value) 
+				return time.value < other.time.value;
+			// For same time, end events before start events
+			return is_start > other.is_start;
+		}
+	};
+	vector<timestamp_t> l1_rid;
+	vector<timestamp_t> cmp1_col;
+	vector<timestamp_t> cmp2_col;
+
+	vector<SweeplineEvent> events;
+	idx_t current_event;
+	std::set<idx_t> active_lhs;
+	std::set<idx_t> active_rhs;
+	// check duplicates - for some reason this also removes a small amount of rows
+	// std::set<std::pair<int64_t, int64_t>> unique_results;
+
+	void InitializeSweepline();
+	bool ProcessNextEvent();
+
+	idx_t SweeplineJoinBlocks(SelectionVector &lsel, SelectionVector &rsel);
 };
 
 idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, SortedTable &marked, int64_t increment,
@@ -319,6 +353,7 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 		// Compute the input columns from the payload
 		keys.Reset();
 		keys.Split(payload, rid_idx);
+		//fprintf(stderr, "expressions.size() = %zu, columns = %llu\n", scanned.size(), keys.ColumnCount());
 		executor.Execute(scanned, keys);
 
 		// Mark the rid column
@@ -372,6 +407,9 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	const auto &order1 = op.lhs_orders[0];
 	const auto &order2 = op.lhs_orders[1];
 
+	const auto &order3 = op.rhs_orders[0];
+	const auto &order4 = op.rhs_orders[1];
+
 	// 2. if (op1 ∈ {>, ≥}) sort L1 in descending order
 	// 3. else if (op1 ∈ {<, ≤}) sort L1 in ascending order
 
@@ -379,6 +417,8 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	//		X/X', Y/Y', R/R'/Li
 	// The first position is the sort key.
 	vector<LogicalType> types;
+	// added
+	types.emplace_back(order1.expression->return_type);
 	types.emplace_back(order2.expression->return_type);
 	types.emplace_back(LogicalType::BIGINT);
 	RowLayout payload_layout;
@@ -388,21 +428,8 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	auto ref = make_uniq<BoundReferenceExpression>(order1.expression->return_type, 0U);
 	vector<BoundOrderByNode> orders;
 	orders.emplace_back(order1.type, order1.null_order, std::move(ref));
-	// The goal is to make i (from the left table) < j (from the right table),
-	// if value[i] and value[j] match the condition 1.
-	// Add a column from_left to solve the problem when there exist multiple equal values in l1.
-	// If the operator is loose inequality, make t1.from_left (== true) sort BEFORE t2.from_left (== false).
-	// Otherwise, make t1.from_left sort (== true) sort AFTER t2.from_left (== false).
-	// For example, if t1.time <= t2.time
-	// | value     | 1     | 1     | 1     | 1     |
-	// | --------- | ----- | ----- | ----- | ----- |
-	// | from_left | T(l2) | T(l2) | F(r1) | F(r2) |
-	// if t1.time < t2.time
-	// | value     | 1     | 1     | 1     | 1     |
-	// | --------- | ----- | ----- | ----- | ----- |
-	// | from_left | F(r2) | F(r1) | T(l2) | T(l1) |
-	// Using this OrderType, if i < j then value[i] (from left table) and value[j] (from right table) match
-	// the condition (t1.time <= t2.time or t1.time < t2.time), then from_left will force them into the correct order.
+	
+	// goal comment
 	auto from_left = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
 	orders.emplace_back(SBIterator::ComparisonValue(cmp1) == 0 ? OrderType::DESCENDING : OrderType::ASCENDING,
 	                    OrderByNullType::ORDER_DEFAULT, std::move(from_left));
@@ -416,7 +443,11 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	auto left_const = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
 	l_executor.AddExpression(*left_const);
 	l_executor.AddExpression(*order2.expression);
+	// added
+	l_executor.AddExpression(*order1.expression);
+
 	AppendKey(t1, l_executor, *l1, 1, 1, b1);
+	fprintf(stderr, "\n made it past first Append\n");
 
 	// RHS has negative rids
 	ExpressionExecutor r_executor(context);
@@ -425,7 +456,11 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	auto right_const = make_uniq<BoundConstantExpression>(Value::BOOLEAN(false));
 	r_executor.AddExpression(*right_const);
 	r_executor.AddExpression(*op.rhs_orders[1].expression);
+	// added
+	r_executor.AddExpression(*op.rhs_orders[0].expression);
+
 	AppendKey(t2, r_executor, *l1, -1, -1, b2);
+	fprintf(stderr, "\n made it past second Append\n");
 
 	if (l1->global_sort_state.sorted_blocks.empty()) {
 		return;
@@ -438,6 +473,29 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 
 	// We don't actually need the L1 column, just its sort key, which is in the sort blocks
 	li = ExtractColumn<int64_t>(*l1, types.size() - 1);
+
+	fprintf(stderr, "\n made it past sorting l1? \n");
+
+	l1_rid = ExtractColumn<timestamp_t>(*l1,2);
+	cmp1_col = ExtractColumn<timestamp_t>(*l1,1);
+	cmp2_col = ExtractColumn<timestamp_t>(*l1, 0);
+
+	fprintf(stderr, "\n check if we accessed 2nd index\n");
+
+	fprintf(stderr, "Number of columns in l1: %zu\n", l1->global_sort_state.payload_layout.GetTypes().size());
+	
+	for (size_t i = 0; i < 5000; i+=50)
+	{
+		fprintf(stderr, "index l1[2] %llu: %lld\n", 
+		static_cast<unsigned long long>(i), 
+		static_cast<long long>(l1_rid[i].value));
+		fprintf(stderr, "comparison 1 l1[1] %llu: %lld\n", 
+			static_cast<unsigned long long>(i), 
+			static_cast<long long>(cmp1_col[i].value));
+		fprintf(stderr, "comparison 2 l1[0] %llu: %lld\n", 
+		static_cast<unsigned long long>(i), 
+		static_cast<long long>(cmp2_col[i].value));
+	}
 
 	// 4. if (op2 ∈ {>, ≥}) sort L2 in ascending order
 	// 5. else if (op2 ∈ {<, ≤}) sort L2 in descending order
@@ -468,6 +526,99 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	// 6. compute the permutation array P of L2 w.r.t. L1
 	p = ExtractColumn<idx_t>(*l2, types.size() - 1);
 
+
+
+	n = l2->count.load();
+	fprintf(stderr, "\n L2 count = %zu\n", n);
+	/*
+	vector<timestamp_t> left_starts = ExtractColumn<timestamp_t>(*l2, 0);
+	vector<timestamp_t> left_ends = ExtractColumn<timestamp_t>(*l2, 1);
+	vector<timestamp_t> right_starts = ExtractColumn<timestamp_t>(*l1,1);
+	vector<timestamp_t> right_ends = ExtractColumn<timestamp_t>(*l1, 0);
+	fprintf(stderr, "\n Thread#  %zu - Column extraction successful: left_starts = %zu, right_starts = %zu, right_ends = %zu\n",
+    std::hash<std::thread::id>{}(std::this_thread::get_id()),
+    left_starts.size(),/* left_ends.size(),*/ 
+	/*right_starts.size(), right_ends.size());
+	*/
+
+	InitializeSweepline();
+	fprintf(stderr, "\nCreated %zu events in total\n", events.size());
+	// sort the events
+
+	SBIterator sort_iter1(l1->global_sort_state, op.conditions[0].comparison);
+    SBIterator sort_iter2(l1->global_sort_state, op.conditions[0].comparison);
+
+	/*std::sort(events.begin(), events.end(),
+	[this, &op](const Event& a, const Event& b) {
+	   // Create new iterators for comparison only
+	   SBIterator iter1(l1->global_sort_state, op.conditions[0].comparison);
+	   SBIterator iter2(l1->global_sort_state, op.conditions[0].comparison);
+	   
+	   //fprintf(stderr, "Sorting events - check out of bounds\n");
+
+	   D_ASSERT(a.idx < l1->count.load());
+	   D_ASSERT(b.idx < l1->count.load());
+	   
+	   // Safely set indices within bounds
+	   iter1.SetIndex(std::min(a.idx, n-1));
+	   iter2.SetIndex(std::min(b.idx, n-1));
+	   
+	   // First sort by timestamp
+	   if (iter1.Compare(iter2) != iter2.Compare(iter1)) {
+		   return iter1.Compare(iter2);
+	   }
+	   
+	   // Then by event type (START before END)
+	   if (a.type != b.type) {
+		   return a.type < b.type;
+	   }
+	   
+	   // Then by table side (RHS before LHS for START, LHS before RHS for END)
+	   return (a.type == Event::START) ? !a.is_left : a.is_left;
+	});*/
+
+	/*fprintf(stderr, "\nSorted %zu events\n", events.size());
+
+	for (size_t i = 0; i < std::min(events.size(), size_t(10)); i++) {
+        fprintf(stderr, "Event %zu: type=%s, idx=%zu, is_left=%d\n", 
+                i, 
+                events[i].type == Event::START ? "START" : "END", 
+                events[i].idx, 
+                events[i].is_left);
+    }*/
+
+	// -- debugging
+		// ---
+	// --- 
+
+
+
+	/*for (size_t i = 0; i < 3; i++)
+	{
+		fprintf(stderr, "%llu: %lld\n", 
+		static_cast<unsigned long long>(i), 
+		static_cast<long long>(right_starts[i].value));
+		fprintf(stderr, "%llu: %lld\n", 
+		static_cast<unsigned long long>(i), 
+		static_cast<long long>(right_ends[i].value));
+		fprintf(stderr, "%llu: %lld\n", 
+			static_cast<unsigned long long>(i), 
+			static_cast<long long>(left_starts[i].value));
+	}*/
+
+	
+
+	// Print column headers for left_starts and right_starts
+	fprintf(stderr, "l1[0] = %s\n", order1.expression->GetName().c_str());
+	fprintf(stderr, "l1[2] = %s\n", order2.expression->GetName().c_str());
+	//fprintf(stderr, "l2[0] = %s\n", order2.expression->GetName().c_str());
+
+	(void) ProcessNextEvent();
+	fprintf(stderr, "\n init process Next Event\n");
+	
+
+	// build a sweepline instead of bloom filter and bit array
+	/*
 	// 7. initialize bit-array B (|B| = n), and set all bits to 0
 	n = l2->count.load();
 	bit_array.resize(ValidityMask::EntryCount(n), 0);
@@ -484,7 +635,72 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	off2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
 	i = 0;
 	j = 0;
-	(void)NextRow();
+	(void)NextRow(); // call this to init it?
+	*/
+}
+
+// init sweepline on RHS
+void IEJoinUnion::InitializeSweepline() {
+	if (l1_rid.empty()) {
+        l1_rid = ExtractColumn<timestamp_t>(*l1, 2);
+        cmp1_col = ExtractColumn<timestamp_t>(*l1, 1);
+        cmp2_col = ExtractColumn<timestamp_t>(*l1, 0);
+    }
+    
+    // Clear existing events and state
+    events.clear();
+    events.reserve(l1_rid.size() * 2); // Each row contributes two events
+    active_lhs.clear();
+    active_rhs.clear();
+    current_event = 0;
+    
+    // Create events for each interval
+    for (size_t i = 0; i < l1_rid.size(); i++) {
+        int64_t row_id = l1_rid[i].value;
+        bool is_lhs = row_id > 0;
+        
+        if (is_lhs) {
+            // For LHS (b): cmp1_col = b.end, cmp2_col = b.start
+            events.push_back({cmp2_col[i], true, row_id});   // Start event
+            events.push_back({cmp1_col[i], false, row_id});  // End event
+        } else {
+            // For RHS (a): cmp1_col = a.start, cmp2_col = a.end
+            events.push_back({cmp1_col[i], true, row_id});   // Start event
+            events.push_back({cmp2_col[i], false, row_id});  // End event
+        }
+    }
+    
+    // Sort events by time
+    std::sort(events.begin(), events.end());
+}
+
+bool IEJoinUnion::ProcessNextEvent() {
+	if (current_event >= events.size()) {
+        return false; // No more events to process
+    }
+    
+    // Get the current event
+    const auto& event = events[current_event++];
+    int64_t row_id = event.rid;
+    bool is_lhs = row_id > 0;
+    
+    if (event.is_start) {
+        // Start event - add to active set and generate results
+        if (is_lhs) {
+            active_lhs.insert(row_id);
+        } else {
+            active_rhs.insert(row_id);
+        }
+    } else {
+        // End event - remove from active set
+        if (is_lhs) {
+            active_lhs.erase(row_id);
+        } else {
+            active_rhs.erase(row_id);
+        }
+    }
+    
+    return true;
 }
 
 bool IEJoinUnion::NextRow() {
@@ -563,6 +779,75 @@ static idx_t NextValid(const ValidityMask &bits, idx_t j, const idx_t n) {
 	return j;
 }
 
+
+idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rsel) {
+	// Initialize sweep line if not already done
+    if (events.empty()) {
+        InitializeSweepline();
+    }
+    
+    idx_t result_count = 0;
+    idx_t max_count = STANDARD_VECTOR_SIZE;
+    
+    // Process events until we have enough results or run out of events
+    while (result_count < max_count && current_event < events.size()) {
+        const auto& event = events[current_event++];
+        int64_t row_id = event.rid;
+        bool is_lhs = row_id > 0;
+        
+        if (event.is_start) {
+            // Start event - add to active set and generate results
+            if (is_lhs) {
+                // Add to active LHS set
+                active_lhs.insert(row_id);
+                
+                // Generate results with all active RHS rows
+                for (const auto& rhs_id : active_rhs) {
+                    // Skip if we're at capacity
+                    if (result_count >= max_count) {
+                        // Back up one event so we can continue from here next time
+                        current_event--;
+                        return result_count;
+                    }
+                    
+                    // Convert to selection vector indices
+                    lsel.set_index(result_count, row_id - 1);     // Positive IDs start at 1
+                    rsel.set_index(result_count, (-rhs_id) - 1);  // Negative IDs start at -1
+                    result_count++;
+                }
+            } else {
+                // Add to active RHS set
+                active_rhs.insert(row_id);
+                
+                // Generate results with all active LHS rows
+                for (const auto& lhs_id : active_lhs) {
+                    // Skip if we're at capacity
+                    if (result_count >= max_count) {
+                        // Back up one event so we can continue from here next time
+                        current_event--;
+                        return result_count;
+                    }
+                    
+                    // Convert to selection vector indices
+                    lsel.set_index(result_count, lhs_id - 1);     // Positive IDs start at 1
+                    rsel.set_index(result_count, (-row_id) - 1);  // Negative IDs start at -1
+                    result_count++;
+                }
+            }
+        } else {
+            // End event - remove from active set
+            if (is_lhs) {
+                active_lhs.erase(row_id);
+            } else {
+                active_rhs.erase(row_id);
+            }
+        }
+    }
+    fprintf(stderr, "\n result_count = %zu\n", result_count);
+    return result_count;
+}
+
+/*
 idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rsel) {
 	// 8. initialize join result as an empty list for tuple pairs
 	idx_t result_count = 0;
@@ -612,7 +897,7 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 
 	return result_count;
 }
-
+*/
 class IEJoinLocalSourceState : public LocalSourceState {
 public:
 	explicit IEJoinLocalSourceState(ClientContext &context, const PhysicalIEJoin &op)
