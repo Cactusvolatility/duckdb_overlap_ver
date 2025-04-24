@@ -54,6 +54,15 @@ PhysicalIEJoin::PhysicalIEJoin(LogicalComparisonJoin &op, PhysicalOperator &left
 		rhs_orders.emplace_back(sense, OrderByNullType::NULLS_LAST, std::move(right));
 	}
 
+	// Debugging output to verify the join key expressions being used for sorting
+	// These expressions determine the sort order for each input side (LHS and RHS)
+	// and are critical for the correct operation of the IEJoin algorithm.
+	// 
+	// LHS0 and RHS0 correspond to the first join predicate (e.g., start time)
+	// LHS1 and RHS1 correspond to the second join predicate (e.g., end time)
+	// 
+	// This helps verify that the sort directions (ascending/descending) are 
+	// derived correctly from the comparison types (>, <, etc.)
 	fprintf(stderr, "LHS0: %s\n", lhs_orders[0].expression->ToString().c_str());
 	fprintf(stderr, "RHS0: %s\n", rhs_orders[0].expression->ToString().c_str());
 	fprintf(stderr, "LHS1: %s\n", lhs_orders[1].expression->ToString().c_str());
@@ -277,10 +286,18 @@ struct IEJoinUnion {
 	unique_ptr<SBIterator> op2;
 	unique_ptr<SBIterator> off2;
 	int64_t lrid;
+	
 
+	//===--------------------------------------------------------------------===//
+	// Sweepline Join Structures & Methods
+	//===--------------------------------------------------------------------===//
+
+	// Represents a timestamped event used in the sweep line algorithm for overlap joins
+	// Each row contributes two events: one for interval start and one for interval end
+	// These are sorted chronologically to simulate a line sweeping through time
 	struct SweeplineEvent {
-		timestamp_t time;
-		bool is_start;
+		timestamp_t time;// The timestamp of the event (start or end of an interval)
+		bool is_start; // True if this is a start event, false for end event
 		int64_t rid; // going to borrow from IEJoinUnion
     
     	// For sorting events
@@ -288,23 +305,36 @@ struct IEJoinUnion {
 			if (time.value != other.time.value) 
 				return time.value < other.time.value;
 			// For same time, end events before start events
+				// !!!IMPORTANT!!!
+					// had issue with equivalent conditions
 			return is_start > other.is_start;
 		}
 	};
-	vector<timestamp_t> l1_rid;
-	vector<timestamp_t> cmp1_col;
-	vector<timestamp_t> cmp2_col;
 
+	// Payload columns extracted from the sorted IEJoin table
+	// - l1_rid: Row IDs for all intervals (positive = LHS, negative = RHS)
+	// - cmp1_col, cmp2_col: Start and end timestamps, reused depending on side
+	vector<timestamp_t> l1_rid;
+	vector<timestamp_t> cmp1_col; // Usually end time
+	vector<timestamp_t> cmp2_col; // Usually start time
+
+	// Core event list for the sweepline
 	vector<SweeplineEvent> events;
-	idx_t current_event;
+	idx_t current_event; // Pointer into `events` for iteration
+
+	// Currently "active" intervals during sweep
+	// These represent rows whose intervals are open and may match incoming events
 	std::set<idx_t> active_lhs;
 	std::set<idx_t> active_rhs;
 	// check duplicates - for some reason this also removes a small amount of rows
 	// std::set<std::pair<int64_t, int64_t>> unique_results;
 
+	// Initialize the sweepline event list based on extracted intervals
 	void InitializeSweepline();
+	// Process a single event: update active sets and optionally emit join matches
 	bool ProcessNextEvent();
-
+	// Executes the full overlap join using the sweepline algorithm
+	// Fills `lsel` and `rsel` with join pair indices
 	idx_t SweeplineJoinBlocks(SelectionVector &lsel, SelectionVector &rsel);
 };
 
@@ -406,7 +436,10 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	// 1. let L1 (resp. L2) be the array of column X (resp. Y )
 	const auto &order1 = op.lhs_orders[0];
 	const auto &order2 = op.lhs_orders[1];
-
+	// Extract the join order expressions for the RHS (right-hand side) input:
+	// - order3 corresponds to the first join predicate (typically interval start)
+	// - order4 corresponds to the second join predicate (typically interval end)
+	// These determine how the RHS input will be sorted and joined using the IEJoin logic
 	const auto &order3 = op.rhs_orders[0];
 	const auto &order4 = op.rhs_orders[1];
 
@@ -443,10 +476,11 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	auto left_const = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
 	l_executor.AddExpression(*left_const);
 	l_executor.AddExpression(*order2.expression);
-	// added
+	// extract key columns from the input for sorting
 	l_executor.AddExpression(*order1.expression);
-
+	//Append LHS data into the unified sorted table `l1`	
 	AppendKey(t1, l_executor, *l1, 1, 1, b1);
+	// Debug message to confirm that LHS data append completed
 	fprintf(stderr, "\n made it past first Append\n");
 
 	// RHS has negative rids
@@ -456,18 +490,18 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	auto right_const = make_uniq<BoundConstantExpression>(Value::BOOLEAN(false));
 	r_executor.AddExpression(*right_const);
 	r_executor.AddExpression(*op.rhs_orders[1].expression);
-	// added
+	// Add the RHS sort expression (e.g., interval start or end) to the executor
 	r_executor.AddExpression(*op.rhs_orders[0].expression);
-
+	// Append RHS data into the unified sorted table `l1`
 	AppendKey(t2, r_executor, *l1, -1, -1, b2);
 	fprintf(stderr, "\n made it past second Append\n");
-
+	// Bail if no valid data was appended to l1
 	if (l1->global_sort_state.sorted_blocks.empty()) {
 		return;
 	}
-
+	// Final sort on l1 using the primary key expression
 	Sort(*l1);
-
+	// Build index iterators on the primary join key
 	op1 = make_uniq<SBIterator>(l1->global_sort_state, cmp1);
 	off1 = make_uniq<SBIterator>(l1->global_sort_state, cmp1);
 
@@ -476,14 +510,14 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 
 	fprintf(stderr, "\n made it past sorting l1? \n");
 
-	l1_rid = ExtractColumn<timestamp_t>(*l1,2);
-	cmp1_col = ExtractColumn<timestamp_t>(*l1,1);
-	cmp2_col = ExtractColumn<timestamp_t>(*l1, 0);
+	l1_rid = ExtractColumn<timestamp_t>(*l1,2); // RID
+	cmp1_col = ExtractColumn<timestamp_t>(*l1,1);// usually end
+	cmp2_col = ExtractColumn<timestamp_t>(*l1, 0); // usually start
 
 	fprintf(stderr, "\n check if we accessed 2nd index\n");
 
 	fprintf(stderr, "Number of columns in l1: %zu\n", l1->global_sort_state.payload_layout.GetTypes().size());
-	
+	// Print sample data for debugging
 	for (size_t i = 0; i < 5000; i+=50)
 	{
 		fprintf(stderr, "index l1[2] %llu: %lld\n", 
@@ -511,9 +545,11 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	ref = make_uniq<BoundReferenceExpression>(order2.expression->return_type, 0U);
 	orders.emplace_back(order2.type, order2.null_order, std::move(ref));
 
+	// Prepare executor and table for sorting L2
 	ExpressionExecutor executor(context);
 	executor.AddExpression(*orders[0].expression);
 
+	// Append all blocks from l1 into l2 to compute the permutation
 	l2 = make_uniq<SortedTable>(context, orders, payload_layout, op);
 	for (idx_t base = 0, block_idx = 0; block_idx < l1->BlockCount(); ++block_idx) {
 		base += AppendKey(*l1, executor, *l2, 1, NumericCast<int64_t>(base), block_idx);
@@ -528,9 +564,11 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 
 
 
-	n = l2->count.load();
+	n = l2->count.load(); // number of joined rows
 	fprintf(stderr, "\n L2 count = %zu\n", n);
 	/*
+	Todo: fix materialization
+
 	vector<timestamp_t> left_starts = ExtractColumn<timestamp_t>(*l2, 0);
 	vector<timestamp_t> left_ends = ExtractColumn<timestamp_t>(*l2, 1);
 	vector<timestamp_t> right_starts = ExtractColumn<timestamp_t>(*l1,1);
@@ -544,31 +582,30 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	InitializeSweepline();
 	fprintf(stderr, "\nCreated %zu events in total\n", events.size());
 	// sort the events
-
+	// Pre-declare iterator to avoid repeated construction (if used)
 	SBIterator sort_iter1(l1->global_sort_state, op.conditions[0].comparison);
     SBIterator sort_iter2(l1->global_sort_state, op.conditions[0].comparison);
 
-	/*std::sort(events.begin(), events.end(),
-	[this, &op](const Event& a, const Event& b) {
-	   // Create new iterators for comparison only
+	/*std::sort(events.begin(), events.end(),(const Event& a, const Event& b) {
+	   // error for iterators
+	
 	   SBIterator iter1(l1->global_sort_state, op.conditions[0].comparison);
 	   SBIterator iter2(l1->global_sort_state, op.conditions[0].comparison);
 	   
-	   //fprintf(stderr, "Sorting events - check out of bounds\n");
+	   //fprintf(stderr, "Sorting events - check out of bounds!!\n");
 
 	   D_ASSERT(a.idx < l1->count.load());
 	   D_ASSERT(b.idx < l1->count.load());
 	   
-	   // Safely set indices within bounds
+	   // getting an out of bounds issue
 	   iter1.SetIndex(std::min(a.idx, n-1));
 	   iter2.SetIndex(std::min(b.idx, n-1));
 	   
-	   // First sort by timestamp
 	   if (iter1.Compare(iter2) != iter2.Compare(iter1)) {
 		   return iter1.Compare(iter2);
 	   }
 	   
-	   // Then by event type (START before END)
+	   // Then by event type 
 	   if (a.type != b.type) {
 		   return a.type < b.type;
 	   }
@@ -639,38 +676,44 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	*/
 }
 
-// init sweepline on RHS
+// Initializes the sweepline event structure for overlap join logic
+// Converts start/end intervals into a flat list of timestamped events
+// These events will later be processed in order to compute overlaps
 void IEJoinUnion::InitializeSweepline() {
+	// Extract interval columns if not already done
 	if (l1_rid.empty()) {
         l1_rid = ExtractColumn<timestamp_t>(*l1, 2);
         cmp1_col = ExtractColumn<timestamp_t>(*l1, 1);
         cmp2_col = ExtractColumn<timestamp_t>(*l1, 0);
     }
     
-    // Clear existing events and state
+    // Prepare the event list and reset state
     events.clear();
-    events.reserve(l1_rid.size() * 2); // Each row contributes two events
+    events.reserve(l1_rid.size() * 2); // each row 2 events 
     active_lhs.clear();
     active_rhs.clear();
     current_event = 0;
     
-    // Create events for each interval
+    // init
     for (size_t i = 0; i < l1_rid.size(); i++) {
         int64_t row_id = l1_rid[i].value;
         bool is_lhs = row_id > 0;
-        
+		
+
+		// LHS events: [start = cmp2_col, end = cmp1_col]
+        // RHS events: [start = cmp1_col, end = cmp2_col]
         if (is_lhs) {
             // For LHS (b): cmp1_col = b.end, cmp2_col = b.start
-            events.push_back({cmp2_col[i], true, row_id});   // Start event
-            events.push_back({cmp1_col[i], false, row_id});  // End event
+            events.push_back({cmp2_col[i], true, row_id});   //start
+            events.push_back({cmp1_col[i], false, row_id});  // end
         } else {
             // For RHS (a): cmp1_col = a.start, cmp2_col = a.end
-            events.push_back({cmp1_col[i], true, row_id});   // Start event
-            events.push_back({cmp2_col[i], false, row_id});  // End event
+            events.push_back({cmp1_col[i], true, row_id});
+            events.push_back({cmp2_col[i], false, row_id});
         }
     }
     
-    // Sort events by time
+    // Sort by time
     std::sort(events.begin(), events.end());
 }
 
@@ -803,7 +846,7 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
                 
                 // Generate results with all active RHS rows
                 for (const auto& rhs_id : active_rhs) {
-                    // Skip if we're at capacity
+                    // Skip if we're at capacity - check size
                     if (result_count >= max_count) {
                         // Back up one event so we can continue from here next time
                         current_event--;
@@ -821,7 +864,7 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
                 
                 // Generate results with all active LHS rows
                 for (const auto& lhs_id : active_lhs) {
-                    // Skip if we're at capacity
+
                     if (result_count >= max_count) {
                         // Back up one event so we can continue from here next time
                         current_event--;
@@ -829,8 +872,8 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
                     }
                     
                     // Convert to selection vector indices
-                    lsel.set_index(result_count, lhs_id - 1);     // Positive IDs start at 1
-                    rsel.set_index(result_count, (-row_id) - 1);  // Negative IDs start at -1
+                    lsel.set_index(result_count, lhs_id - 1);
+                    rsel.set_index(result_count, (-row_id) - 1);
                     result_count++;
                 }
             }

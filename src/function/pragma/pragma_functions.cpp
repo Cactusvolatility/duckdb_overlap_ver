@@ -132,8 +132,19 @@ static void PragmaDisableOptimizer(ClientContext &context, const FunctionParamet
 	ClientConfig::GetConfig(context).enable_optimizer = false;
 }
 
+static void PragmaForceMyJoin(ClientContext &context, const FunctionParameters &parameters) {
+	ClientConfig::GetConfig(context).force_my_join = true;
+}
+
+static void PragmaDisableMyJoin(ClientContext &context, const FunctionParameters &parameters) {
+	ClientConfig::GetConfig(context).force_my_join = false;
+}
+
 void PragmaFunctions::RegisterFunction(BuiltinFunctions &set) {
 	RegisterEnableProfiling(set);
+	
+	set.AddFunction(PragmaFunction::PragmaStatement("overlap_on", PragmaForceMyJoin));
+	set.AddFunction(PragmaFunction::PragmaStatement("off_overlap", PragmaDisableMyJoin));
 
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_profile", PragmaDisableProfiling));
 	set.AddFunction(PragmaFunction::PragmaStatement("disable_profiling", PragmaDisableProfiling));

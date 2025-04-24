@@ -18,64 +18,16 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/constants.hpp"
 #include <unordered_set>
-
-// Optional (only if explicitly needed)
-// #include "duckdb/planner/bound_result_modifier.hpp"
-
-//===----------------------------------------------------------------------===//
-//                         DuckDB
-//
-// duckdb/execution/operator/join/physical_overlap_join.hpp
-//
-//
-//===----------------------------------------------------------------------===//
-
-//#pragma once
-
-#include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/common/sort/sort.hpp"
 
 namespace duckdb {
 
+class SweeplineIndex;
+class GlobalSortedTable;
+
 struct GlobalSortState;
 
-//! SweeplineIndex represents an efficient data structure for finding
-//! overlapping time intervals
-class SweeplineIndex {
-public:
-    SweeplineIndex();
-    
-    void AddInterval(idx_t row_id, timestamp_t start, timestamp_t end);
-    void Prepare();
-    // need to make it thread-safe
-    vector<idx_t> FindOverlaps(timestamp_t start, timestamp_t end, 
-                         size_t &current_event_idx,
-                         unordered_set<idx_t> &active_intervals);
-    
-private:
-    struct Interval {
-        idx_t row_id;
-        timestamp_t start;
-        timestamp_t end;
-    };
-    
-    struct Event {
-        timestamp_t time;
-        bool is_start;
-        idx_t interval_idx;
-    };
-    
-    // this is my "struct" of sorted vectors
-    vector<Interval> intervals;
-    vector<Event> events;
-
-    // these need to go to local thread
-    /*
-    size_t current_event_idx = 0;
-    unordered_set<idx_t> active_intervals;
-    */
-};
 
 //! PhysicalOverlapJoin represents a specialized join that efficiently finds
 //! overlapping time intervals between two tables
@@ -130,6 +82,9 @@ public:
             return global_sort_state.sorted_blocks[0]->radix_sorting_data[i]->count;
         }
 
+        timestamp_t GetStartTime(idx_t row_idx);
+        timestamp_t GetEndTime(idx_t row_idx);
+
         void Combine(LocalSortedTable &ltable);
         void Print();
 
@@ -163,9 +118,10 @@ public:
     };
 
 public:
-    PhysicalOverlapJoin(LogicalComparisonJoin &op, unique_ptr<PhysicalOperator> left,
-                      unique_ptr<PhysicalOperator> right, vector<JoinCondition> cond, JoinType join_type,
-                      idx_t estimated_cardinality);
+    // why am I not inheriting physicalcomparison join?
+	PhysicalOverlapJoin(LogicalComparisonJoin &op, PhysicalOperator &left,
+            PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
+            idx_t estimated_cardinality);
 
     // Projection mappings
     using ProjectionMapping = vector<column_t>;
@@ -174,7 +130,6 @@ public:
     
     // do I need both?
     // The join key types for the left and right children
-    vector<LogicalType> join_key_types;
 	vector<BoundOrderByNode> lhs_orders;
 	vector<BoundOrderByNode> rhs_orders;
 
@@ -206,14 +161,16 @@ public:
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
 
+    // constants - what do I need to do with them?
 	bool IsSource() const override {
 		return true;
 	}
 	bool ParallelSource() const override {
 		return true;
 	}
-
-	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate_p) const override;
+    // hopefully we don't need GetProgress from iejoin
+        // else would need to implement initialize and everything else...
+	/*ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate_p) const override;*/
 
 public:
 	// Sink Interface
@@ -237,6 +194,49 @@ public:
 
 
 };
+
+
+//! SweeplineIndex represents an efficient data structure for finding
+//! overlapping time intervals
+class SweeplineIndex {
+    public:
+        SweeplineIndex();
+        
+        void AddInterval(idx_t row_id, timestamp_t start, timestamp_t end);
+        void Prepare();
+        // need to make it thread-safe
+            // make it compatible with ExecuteInternal
+        void FindOverlaps(PhysicalOverlapJoin::GlobalSortedTable &left_table, 
+                    PhysicalOverlapJoin::GlobalSortedTable &right_table,
+                    vector<pair<idx_t, idx_t>> &result_pairs, 
+                    size_t &current_event_idx,
+                    unordered_set<idx_t> &active_intervals,
+                    idx_t start_idx, 
+                    idx_t end_idx);
+        
+    private:
+        struct Interval {
+            idx_t row_id;
+            timestamp_t start;
+            timestamp_t end;
+        };
+        
+        struct Event {
+            timestamp_t time;
+            bool is_start;
+            idx_t interval_idx;
+        };
+        
+        // this is my "struct" of sorted vectors
+        vector<Interval> intervals;
+        vector<Event> events;
+    
+        // these need to go to local thread
+        /*
+        size_t current_event_idx = 0;
+        unordered_set<idx_t> active_intervals;
+        */
+    };
 
 } // namespace duckdb
 

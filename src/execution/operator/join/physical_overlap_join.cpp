@@ -19,16 +19,9 @@
 #include "duckdb/parallel/base_pipeline_event.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parallel/executor_task.hpp"
+#include "duckdb/parallel/meta_pipeline.hpp"
 
 #include <thread>
-
-#include "duckdb/execution/operator/join/physical_overlap_join.hpp"
-
-// Similar includes as in range join
-#include "duckdb/common/fast_mem.hpp"
-#include "duckdb/common/operator/comparison_operators.hpp"
-#include "duckdb/common/row_operations/row_operations.hpp"
-// ... other includes
 
 namespace duckdb {
 
@@ -55,65 +48,95 @@ void SweeplineIndex::AddInterval(idx_t row_id, timestamp_t start, timestamp_t en
 void SweeplineIndex::Prepare() {
     // Prepare the index for searching
     // Sort intervals by start time
-        // currently just use this generic sort
-    sort(intervals.begin(), intervals.end(), [](const Interval &a, const Interval &b) {
-        return a.start < b.start;
+    std::sort(events.begin(), events.end(), [](const Event &a, const Event &b) {
+        if (a.time != b.time) {
+            return a.time < b.time;
+        }
+
+        // if equal time then get end events
+        return a.is_start < b.is_start;
     });
 }
 
-vector<idx_t> SweeplineIndex::FindOverlaps(timestamp_t q_start, timestamp_t q_end) {
-    // Find overlapping intervals
-    vector<idx_t> results;
+// couple of strategies
+    // batching
+    // iteratively
+    // whole chunk
+        // for simplicity we are going back to whole chunk and allowing the scheduler to handle this
+        // 04-16: change of plans again
+            // provide input of start/end and process those
+void SweeplineIndex::FindOverlaps(
+                PhysicalOverlapJoin::GlobalSortedTable &left_table, 
+                PhysicalOverlapJoin::GlobalSortedTable &right_table,
+                vector<pair<idx_t, idx_t>> &result_pairs, 
+                size_t &current_event_idx,
+                unordered_set<idx_t> &active_intervals,
+                idx_t start_idx,
+                idx_t end_idx) {
+                    
+    // reset the intervals for this thread
+                    // originally wanted to make this sequential but don't know how
+                    // make the partitioning sequential
     active_intervals.clear();
 
-    // set the method call to the last event call
+    if (end_idx <= start_idx) {
+        return; // No rows to process
+    }
+    
+    // Get the range of rows to process from left_table
+        // change to start_idx and end_idx
+    /*idx_t start_idx = 0;
+    idx_t end_idx = left_table.Count();*/
+
+    // check if out of bounds
+    end_idx = std::min(end_idx, left_table.Count());
+    
+    // Since the left table is sorted by start time, we can process events incrementally
     size_t event_idx = current_event_idx;
-    while (event_idx < events.size() && events[event_idx].time < q_start) {
-        // If this is a start event, add the interval to active set
-        if (events[event_idx].is_start) {
-            active_intervals.insert(events[event_idx].interval_idx);
-        } else {
-            // Remove from active set (implementation depends on your data structure)
-            active_intervals.erase(events[event_idx].interval_idx);
-        }
-        event_idx++;
-    }
     
-    // Check intervals that are already active when we reach query_start
-    for (idx_t interval_idx : active_intervals) {
-        const Interval& interval = intervals[interval_idx];
-        // These intervals started before query_start and are still active
-        // They overlap with the query if they end after query_start
-        if (interval.end >= q_start) {
-            results.push_back(interval.row_id);
-        }
-    }
-    
-    // Continue processing events until query_end
-    while (event_idx < events.size() && events[event_idx].time <= q_end) {
-        const Event& event = events[event_idx];
+    for (idx_t left_idx = start_idx; left_idx < end_idx; left_idx++) {
+        // Get start/end times directly using your pointer methods
+        timestamp_t query_start = left_table.GetStartTime(left_idx);
+        timestamp_t query_end = left_table.GetEndTime(left_idx);
         
-        if (event.is_start) {
-            // New interval becomes active
-            active_intervals.insert(event.interval_idx);
-            
-            // Since it starts during our query range, if it doesn't end before
-            // query_start, it's an overlap
-            const Interval& interval = intervals[event.interval_idx];
-            if (interval.end >= q_start) {
-                results.push_back(interval.row_id);
+        // Advance the sweepline to the current query start time
+        while (event_idx < events.size() && events[event_idx].time < query_start) {
+            // Update active intervals set
+            if (events[event_idx].is_start) {
+                active_intervals.insert(events[event_idx].interval_idx);
+            } else {
+                active_intervals.erase(events[event_idx].interval_idx);
             }
-        } else {
-            // Interval is no longer active
-            active_intervals.erase(event.interval_idx);
-            // No need to check for overlaps here as we've already added this interval
-            // if it was relevant
+            event_idx++;
         }
         
-        event_idx++;
+        // Check active intervals for overlaps
+        for (idx_t interval_idx : active_intervals) {
+            const Interval& interval = intervals[interval_idx];
+            if (interval.end >= query_start) {
+                result_pairs.emplace_back(left_idx, interval.row_id);
+            }
+        }
+        
+        // Process events between query_start and query_end
+        size_t temp_event_idx = event_idx;
+        while (temp_event_idx < events.size() && events[temp_event_idx].time <= query_end) {
+            const Event& event = events[temp_event_idx];
+            if (event.is_start) {
+                // A new interval starts during our query range
+                const Interval& interval = intervals[event.interval_idx];
+                if (interval.end >= query_start) {
+                    result_pairs.emplace_back(left_idx, interval.row_id);
+                }
+            }
+            temp_event_idx++;
+        }
     }
-    return results;
+    
+    // Save the current event index for efficiency
+    current_event_idx = event_idx;
 }
+
 
 //===--------------------------------------------------------------------===//
 // LocalSortedTable Implementation
@@ -171,31 +194,70 @@ void PhysicalOverlapJoin::LocalSortedTable::Sink(DataChunk &input, GlobalSortSta
 idx_t PhysicalOverlapJoin::LocalSortedTable::MergeNulls(Vector &primary, const vector<JoinCondition> &conditions) {
     // Implementation of MergeNulls method
         // don't know if this is required
-    return 0; // Placeholder
+    return 0; // Placeholder - don't even need to do anything
 }
 
 //===--------------------------------------------------------------------===//
 // GlobalSortedTable Implementation
 //===--------------------------------------------------------------------===//
-PhysicalOverlapJoin::GlobalSortedTable::GlobalSortedTable(ClientContext &context, const vector<BoundOrderByNode> &orders,
-                                                       RowLayout &payload_layout, const PhysicalOperator &op_p)
-    : op(op_p), global_sort_state(BufferManager::GetBufferManager(context), orders, payload_layout),
-      count(0), memory_per_thread(0) {
-    // Constructor implementation
-}
 
+// do I need buffer manager here?
 PhysicalOverlapJoin::GlobalSortedTable::GlobalSortedTable(ClientContext &context, const vector<BoundOrderByNode> &orders,
                                                         RowLayout &payload_layout, const PhysicalOperator &op_p)
-    : op(op_p), global_sort_state(BufferManager::GetBufferManager(context), orders, payload_layout), has_null(0),
-      count(0), memory_per_thread(0) {
+    : op(op_p), global_sort_state(context, orders, payload_layout), has_null(0), count(0), memory_per_thread(0) {
 
 	// Set external (can be forced with the PRAGMA)
+    fprintf(stderr, "OverlapJoin: GetData called\n");
 	auto &config = ClientConfig::GetConfig(context);
 	global_sort_state.external = config.force_external;
 	memory_per_thread = PhysicalOverlapJoin::GetMaxThreadMemory(context);
 }
 
+// had an issue with passing const to the global_sort_state
+timestamp_t PhysicalOverlapJoin::GlobalSortedTable::GetStartTime(idx_t row_idx) {
+    // Access the sorted block
+    D_ASSERT(!global_sort_state.sorted_blocks.empty());
+    auto &block = global_sort_state.sorted_blocks[0];
+    auto &layout = block->payload_data->layout;
+    
+    // Calculate the offset for the start time column
+    idx_t start_time_offset = layout.GetOffsets()[0]; // Assuming start time is the first column
+    
+    // Access the row data
+    SBScanState scan_state(global_sort_state.buffer_manager, global_sort_state);
+    scan_state.sb = block.get();
+    scan_state.SetIndices(0, row_idx);
+    scan_state.PinData(*block->payload_data);
+    
+    // Get a pointer to the row data
+    auto data_ptr = scan_state.DataPtr(*block->payload_data);
+    
+    // Important: Don't add row_idx * layout.GetRowWidth() again since SetIndices already positions us
+    // at the correct row
+    return *((timestamp_t *)(data_ptr + start_time_offset));
+}
 
+timestamp_t PhysicalOverlapJoin::GlobalSortedTable::GetEndTime(idx_t row_idx) {
+    // Access the sorted block
+    D_ASSERT(!global_sort_state.sorted_blocks.empty());
+    auto &block = global_sort_state.sorted_blocks[0];
+    auto &layout = block->payload_data->layout;
+    
+    // Calculate the offset for the end time column
+    idx_t end_time_offset = layout.GetOffsets()[1]; // Assuming end time is the second column
+    
+    // Access the row data
+    SBScanState scan_state(global_sort_state.buffer_manager, global_sort_state);
+    scan_state.sb = block.get();
+    scan_state.SetIndices(0, row_idx);
+    scan_state.PinData(*block->payload_data);
+    
+    // Get a pointer to the row data
+    auto data_ptr = scan_state.DataPtr(*block->payload_data);
+    
+    // Just use the offset without adding row_idx calculations since SetIndices handles that
+    return *((timestamp_t *)(data_ptr + end_time_offset));
+}
 void PhysicalOverlapJoin::GlobalSortedTable::Combine(LocalSortedTable &ltable) {
 	global_sort_state.AddLocalState(ltable.local_sort_state);
 	has_null += ltable.has_null;
@@ -206,6 +268,18 @@ void PhysicalOverlapJoin::GlobalSortedTable::BuildSweeplineIndex() {
     // Implementation of BuildSweeplineIndex
         // make_unique is deprecated, use make_uniq
     sweep_index = make_uniq<SweeplineIndex>();
+
+    // still need to use the helper functions to get start and end
+    for(idx_t row_idx = 0; row_idx < Count() ; row_idx++) {
+        auto start_time = GetStartTime(row_idx);
+        auto end_time = GetEndTime(row_idx);
+
+        // add to Intervals
+        sweep_index->AddInterval(row_idx, start_time, end_time);
+    }
+
+    // run prepare for global merge
+    sweep_index->Prepare();
     
     // Build the index from sorted data
 }
@@ -300,90 +374,10 @@ void PhysicalOverlapJoin::GlobalSortedTable::Finalize(Pipeline &pipeline, Event 
 	}
 }
 
-//===--------------------------------------------------------------------===//
-// PhysicalOverlapJoin Implementation
-//===--------------------------------------------------------------------===//
-
-// !!! TODO: !!!
-PhysicalOverlapJoin::PhysicalOverlapJoin(LogicalComparisonJoin &op, unique_ptr<PhysicalOperator> left,
-                                       unique_ptr<PhysicalOperator> right, vector<JoinCondition> cond,
-                                       JoinType join_type, idx_t estimated_cardinality)
-    : PhysicalComparisonJoin(
-        op, 
-        type, 
-        std::move(cond), 
-        join_type, 
-        estimated_cardinality) 
-{
-            // constructor - should I be using COMPARISON_JOIN or just JOIN?
-
-    // join keys
-    for (auto &condition : conditions) {
-        join_key_types.push_back(condition.left->return_type);
-    }
-
-    // --- Set up sort orders: only sort by start time (assume it's first join condition)
-    D_ASSERT(conditions.size() >= 2);
-    // Left input: sort by left.start
-    lhs_order.expression = conditions[0].left->Copy();
-    lhs_order.order_type = OrderType::ASCENDING;
-    lhs_orders.push_back(std::move(lhs_order));
-
-    // Right input: sort by right.start
-    rhs_order.expression = conditions[1].right->Copy();
-    rhs_order.order_type = OrderType::ASCENDING;
-    rhs_orders.push_back(std::move(rhs_order));
-}
-
 BufferHandle PhysicalOverlapJoin::SliceSortedPayload(DataChunk &payload, GlobalSortState &state, const idx_t block_idx,
                                                    const SelectionVector &result, const idx_t result_count,
                                                    const idx_t left_cols) {
-	D_ASSERT(state.sorted_blocks.size() == 1);
-	SBScanState read_state(state.buffer_manager, state);
-	read_state.sb = state.sorted_blocks[0].get();
-	auto &sorted_data = *read_state.sb->payload_data;
-
-	read_state.SetIndices(block_idx, 0);
-	read_state.PinData(sorted_data);
-	const auto data_ptr = read_state.DataPtr(sorted_data);
-	data_ptr_t heap_ptr = nullptr;
-
-	// Set up a batch of pointers to scan data from
-	Vector addresses(LogicalType::POINTER, result_count);
-	auto data_pointers = FlatVector::GetData<data_ptr_t>(addresses);
-
-	// Set up the data pointers for the values that are actually referenced
-	const idx_t &row_width = sorted_data.layout.GetRowWidth();
-
-	auto prev_idx = result.get_index(0);
-	SelectionVector gsel(result_count);
-	idx_t addr_count = 0;
-	gsel.set_index(0, addr_count);
-	data_pointers[addr_count] = data_ptr + prev_idx * row_width;
-	for (idx_t i = 1; i < result_count; ++i) {
-		const auto row_idx = result.get_index(i);
-		if (row_idx != prev_idx) {
-			data_pointers[++addr_count] = data_ptr + row_idx * row_width;
-			prev_idx = row_idx;
-		}
-		gsel.set_index(i, addr_count);
-	}
-	++addr_count;
-
-	// Unswizzle the offsets back to pointers (if needed)
-	if (!sorted_data.layout.AllConstant() && state.external) {
-		heap_ptr = read_state.payload_heap_handle.Ptr();
-	}
-
-	// Deserialize the payload data
-	auto sel = FlatVector::IncrementalSelectionVector();
-	for (idx_t col_no = 0; col_no < sorted_data.layout.ColumnCount(); col_no++) {
-		auto &col = payload.data[left_cols + col_no];
-		RowOperations::Gather(addresses, *sel, col, *sel, addr_count, sorted_data.layout, col_no, 0, heap_ptr);
-		col.Slice(gsel, result_count);
-	}
-
-	return std::move(read_state.payload_heap_handle);	D_ASSERT(state.sorted_blocks.size() == 1);
+    D_ASSERT(state.sorted_blocks.size() == 1);
 	SBScanState read_state(state.buffer_manager, state);
 	read_state.sb = state.sorted_blocks[0].get();
 	auto &sorted_data = *read_state.sb->payload_data;
@@ -433,11 +427,17 @@ BufferHandle PhysicalOverlapJoin::SliceSortedPayload(DataChunk &payload, GlobalS
     //return BufferHandle();
 }
 
-// !!! TODO: !!!
+/* - redundant FindOverlaps call
+
+
+    // this is the helper method for running FindOverlaps on the global left and right sides
 void PhysicalOverlapJoin::FindOverlaps(GlobalSortedTable &left, GlobalSortedTable &right,
                                       vector<pair<idx_t, idx_t>> &result_pairs) const {
     // Implementation of FindOverlaps for left and right side of Sorted Table
 }
+
+*/
+
 
 // should be no change since the projection is not overlap join specific
 void PhysicalOverlapJoin::ProjectResult(DataChunk &chunk, DataChunk &result) const {
@@ -445,11 +445,71 @@ void PhysicalOverlapJoin::ProjectResult(DataChunk &chunk, DataChunk &result) con
 	for (idx_t i = 0; i < left_projected; ++i) {
 		result.data[i].Reference(chunk.data[left_projection_map[i]]);
 	}
-	const auto left_width = children[0]->types.size();
+	const auto left_width = children[0].get().GetTypes().size();
 	for (idx_t i = 0; i < right_projection_map.size(); ++i) {
 		result.data[left_projected + i].Reference(chunk.data[left_width + right_projection_map[i]]);
 	}
 	result.SetCardinality(chunk);
+}
+
+// !!! TODO: !!!
+PhysicalOverlapJoin::PhysicalOverlapJoin(LogicalComparisonJoin &op, PhysicalOperator &left,
+                                            PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
+                                            idx_t estimated_cardinality)
+        : PhysicalComparisonJoin(
+                op, 
+                PhysicalOperatorType::OVERLAP_JOIN, 
+                std::move(cond), 
+                join_type, 
+                estimated_cardinality) 
+    {
+    // pass children to state
+    children.push_back(left);
+    children.push_back(right);
+        
+    // Fill out the left projection map.
+    left_projection_map = op.left_projection_map;
+    if (left_projection_map.empty()) {
+        const auto left_count = children[0].get().GetTypes().size();
+        left_projection_map.reserve(left_count);
+        for (column_t i = 0; i < left_count; ++i) {
+            left_projection_map.emplace_back(i);
+        }
+    }
+    
+    // Fill out the right projection map.
+    right_projection_map = op.right_projection_map;
+    if (right_projection_map.empty()) {
+        const auto right_count = children[1].get().GetTypes().size();
+        right_projection_map.reserve(right_count);
+        for (column_t i = 0; i < right_count; ++i) {
+            right_projection_map.emplace_back(i);
+        }
+    }
+    
+    // Extract types
+        // well it's only timestamp - so I don't care about it
+    /*
+    for (auto &condition : conditions) {
+        join_key_types.push_back(condition.left->return_type);
+    }*/
+    
+    // since we're using pragma to force the operator this is just for testing
+    D_ASSERT(conditions.size() >= 2);
+    
+    // We only care about ordering the start time which is conditions[0]
+    lhs_orders.emplace_back(
+        OrderType::ASCENDING,
+        OrderByNullType::NULLS_LAST,
+        conditions[0].left->Copy()
+    );
+    
+    rhs_orders.emplace_back(
+        OrderType::ASCENDING,
+        OrderByNullType::NULLS_LAST,
+        conditions[0].right->Copy()
+    );
+
 }
 
 //===--------------------------------------------------------------------===//
@@ -479,13 +539,13 @@ class OverlapGlobalState : public GlobalSinkState {
         OverlapGlobalState(ClientContext &context, const PhysicalOverlapJoin &op) : child(0) {
             tables.resize(2);
             RowLayout lhs_layout;
-            lhs_layout.Initialize(op.children[0]->types);
+            lhs_layout.Initialize(op.children[0].get().GetTypes());
             vector<BoundOrderByNode> lhs_order;
             lhs_order.emplace_back(op.lhs_orders[0].Copy());
             tables[0] = make_uniq<GlobalSortedTable>(context, lhs_order, lhs_layout, op);
     
             RowLayout rhs_layout;
-            rhs_layout.Initialize(op.children[1]->types);
+            rhs_layout.Initialize(op.children[1].get().GetTypes());
             vector<BoundOrderByNode> rhs_order;
             rhs_order.emplace_back(op.rhs_orders[0].Copy());
             tables[1] = make_uniq<GlobalSortedTable>(context, rhs_order, rhs_layout, op);
@@ -552,6 +612,224 @@ SinkCombineResultType PhysicalOverlapJoin::Combine(ExecutionContext &context, Op
 	client_profiler.Flush(context.thread.profiler);
 
 	return SinkCombineResultType::FINISHED;
+}
+
+SinkFinalizeType PhysicalOverlapJoin::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+    OperatorSinkFinalizeInput &input) const {
+    auto &gstate = input.global_state.Cast<OverlapGlobalState>();
+    auto &table = *gstate.tables[gstate.child];
+    auto &global_sort_state = table.global_sort_state;
+
+    // Handle empty input on the RHS
+    if (gstate.child == 1 && global_sort_state.sorted_blocks.empty()) {
+        return SinkFinalizeType::NO_OUTPUT_POSSIBLE;
+    }
+
+    // Finalize sorting for the current child
+    table.Finalize(pipeline, event);
+
+    // buildsweepline here
+        // this way when we call getData we don't have to worry about it
+    if (gstate.child == 1) {
+        auto &right_table = *gstate.tables[1];
+        right_table.BuildSweeplineIndex();
+    }
+
+    // Move to the next child (if applicable)
+    ++gstate.child;
+
+    return SinkFinalizeType::READY;
+
+}
+
+//===--------------------------------------------------------------------===//
+// Operator
+//===--------------------------------------------------------------------===//
+
+// shit, executeInternal is not for Sink
+    // this is for the volcano pull model
+    // I knew i should've stuck more closely to iejoin...
+OperatorResultType PhysicalOverlapJoin::ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+                                                        GlobalOperatorState &gstate, OperatorState &state) const {
+    
+    // just leave it as finished, we aren't doing volcano
+    return OperatorResultType::FINISHED;                                                        
+}
+
+//===--------------------------------------------------------------------===//
+// Source
+//===--------------------------------------------------------------------===//
+class OverlapGlobalSourceState : public GlobalSourceState {
+public:
+    explicit OverlapGlobalSourceState(OverlapGlobalState &sink_state) {
+        // Reference tables from the sink phase
+        left_table = sink_state.tables[0].get();
+        right_table = sink_state.tables[1].get();
+        // Initialize the sweepline index from the right table - creates pointer
+        sweepline_index = right_table->sweep_index.get();
+        // Initialize the current chunk index
+        current_chunk_idx = 0;
+    }
+
+    //! Reference to the left and right tables
+    PhysicalOverlapJoin::GlobalSortedTable *left_table;
+    PhysicalOverlapJoin::GlobalSortedTable *right_table;
+
+    //! Reference to the sweepline index
+    SweeplineIndex *sweepline_index;
+
+    //! Current chunk being processed
+    atomic<idx_t> current_chunk_idx;
+
+    idx_t MaxThreads() override {
+        // Allow multiple threads based on the number of chunks in the left table
+        return (left_table->Count() + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+    }
+};
+
+class OverlapLocalSourceState : public LocalSourceState {
+public:
+    OverlapLocalSourceState() : 
+        current_position(0),
+        thread_event_idx(0) {
+    }
+
+    //! Current position in the chunk being processed
+    idx_t current_position;
+
+    //! Sweep-line algorithm state
+    size_t thread_event_idx;
+    unordered_set<idx_t> thread_active_intervals;
+
+    //! Buffer for holding result pairs
+    vector<pair<idx_t, idx_t>> result_pairs;
+
+    //! Reset the local state for the next chunk
+    void Reset() {
+        current_position = 0;
+        thread_event_idx = 0;
+        thread_active_intervals.clear();
+        result_pairs.clear();
+    }
+};
+
+unique_ptr<GlobalSourceState> PhysicalOverlapJoin::GetGlobalSourceState(ClientContext &context) const {
+    // Get the sink state
+    auto &sink_state = static_cast<OverlapGlobalState&>(*this->sink_state);
+    // Create global source state that references the sink state
+    return make_uniq<OverlapGlobalSourceState>(sink_state);
+}
+
+unique_ptr<LocalSourceState> PhysicalOverlapJoin::GetLocalSourceState(ExecutionContext &context,
+                                                                      GlobalSourceState &gstate) const {
+    return make_uniq<OverlapLocalSourceState>();
+}
+
+
+
+SourceResultType PhysicalOverlapJoin::GetData(ExecutionContext &context, DataChunk &result,
+                                              OperatorSourceInput &input) const {
+    auto &gstate = input.global_state.Cast<OverlapGlobalSourceState>();
+    auto &lstate = input.local_state.Cast<OverlapLocalSourceState>();
+
+    // If there are no more results, return FINISHED
+    idx_t chunk_idx = gstate.current_chunk_idx.fetch_add(1);
+
+    // compare and see if there is anything left from the left table
+    if (chunk_idx * STANDARD_VECTOR_SIZE >= gstate.left_table->Count()) {
+        return SourceResultType::FINISHED;
+    }
+
+    //D_ASSERT()
+    // clear out the last batch of results that this thread had
+    lstate.result_pairs.clear();
+
+    // run Find_Overlaps - this will go over the whole chunk
+    gstate.sweepline_index->FindOverlaps(*gstate.left_table, 
+                                        *gstate.right_table, 
+                                        lstate.result_pairs, 
+                                        lstate.thread_event_idx,
+                                        lstate.thread_active_intervals,
+                                        chunk_idx * STANDARD_VECTOR_SIZE,
+                                        std::min((chunk_idx + 1) * STANDARD_VECTOR_SIZE, gstate.left_table->Count())
+                                    );
+    
+    if (lstate.result_pairs.empty()) {
+        // No results found, return FINISHED
+        return SourceResultType::FINISHED;
+    }
+
+    // check types of the children from left and right
+    // should be a non-issue? we only have time
+    vector<LogicalType> result_types = children[0].get().GetTypes();
+    const auto &right_types = children[1].get().GetTypes();
+    for (auto &type : right_types) {
+        result_types.push_back(type);
+    }
+
+    // initialize the result chunk
+    // see duckdb/common/types/data_chunk.hpp
+    result.Initialize(Allocator::Get(context.client), result_types);
+
+    idx_t result_count = std::min(idx_t(lstate.result_pairs.size()), (idx_t)STANDARD_VECTOR_SIZE);
+
+    // hold the values of from our result pairs
+    SelectionVector left_sel(result_count);
+    SelectionVector right_sel(result_count);
+
+    for (idx_t i = 0; i < result_count; i++) {
+        left_sel.set_index(i, lstate.result_pairs[i].first);
+        right_sel.set_index(i, lstate.result_pairs[i].second);
+    }
+
+    DataChunk left_chunk, right_chunk;
+    left_chunk.Initialize(Allocator::Get(context.client), children[0].get().GetTypes());
+    right_chunk.Initialize(Allocator::Get(context.client), children[1].get().GetTypes());
+    
+    // Fetch data from the sorted tables
+    BufferHandle left_handle = SliceSortedPayload(left_chunk, gstate.left_table->global_sort_state, 0, 
+                                                left_sel, result_count);
+    BufferHandle right_handle = SliceSortedPayload(right_chunk, gstate.right_table->global_sort_state, 0,
+                                                right_sel, result_count);
+    result.SetCardinality(result_count);
+
+    // Copy data from left and right chunks to the result chunk
+    for (idx_t i = 0; i < left_chunk.ColumnCount(); i++) {
+        result.data[i].Reference(left_chunk.data[i]);
+    }
+    
+    for (idx_t i = 0; i < right_chunk.ColumnCount(); i++) {
+        result.data[left_chunk.ColumnCount() + i].Reference(right_chunk.data[i]);
+    }
+
+    return SourceResultType::HAVE_MORE_OUTPUT;
+}
+
+//===--------------------------------------------------------------------===//
+// Pipeline Construction
+//===--------------------------------------------------------------------===//
+void PhysicalOverlapJoin::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+	D_ASSERT(children.size() == 2);
+	if (meta_pipeline.HasRecursiveCTE()) {
+		throw NotImplementedException("OverlapJoins are not supported in recursive CTEs yet");
+	}
+
+	// becomes a source after both children fully sink their data
+	meta_pipeline.GetState().SetPipelineSource(current, *this);
+
+	// Create one child meta pipeline that will hold the LHS and RHS pipelines
+	auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this);
+
+	// Build out LHS
+	auto lhs_pipeline = child_meta_pipeline.GetBasePipeline();
+	children[0].get().BuildPipelines(*lhs_pipeline, child_meta_pipeline);
+
+	// Build out RHS
+	auto &rhs_pipeline = child_meta_pipeline.CreatePipeline();
+	children[1].get().BuildPipelines(rhs_pipeline, child_meta_pipeline);
+
+	// Despite having the same sink, RHS and everything created after it need their own (same) PipelineFinishEvent
+	child_meta_pipeline.AddFinishEvent(rhs_pipeline);
 }
 
 } // namespace duckdb
